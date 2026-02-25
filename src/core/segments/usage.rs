@@ -21,13 +21,78 @@ struct UsagePeriod {
 struct ApiUsageCache {
     five_hour_utilization: f64,
     seven_day_utilization: f64,
+    #[serde(default)]
     five_hour_resets_at: Option<String>,
+    #[serde(default)]
     seven_day_resets_at: Option<String>,
+    // Legacy cache field used before split reset timestamps.
+    #[serde(default, rename = "resets_at", skip_serializing)]
+    legacy_resets_at: Option<String>,
     cached_at: String,
 }
 
 #[derive(Default)]
 pub struct UsageSegment;
+
+#[derive(Debug, Clone, Copy, Default)]
+enum ResetPeriod {
+    #[default]
+    Session,
+    Weekly,
+}
+
+impl ResetPeriod {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Weekly => "weekly",
+        }
+    }
+}
+
+impl TryFrom<&str> for ResetPeriod {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.eq_ignore_ascii_case("session") {
+            Ok(Self::Session)
+        } else if value.eq_ignore_ascii_case("weekly") {
+            Ok(Self::Weekly)
+        } else {
+            Err(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+enum ResetFormat {
+    #[default]
+    Time,
+    Duration,
+}
+
+impl ResetFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Time => "time",
+            Self::Duration => "duration",
+        }
+    }
+}
+
+impl TryFrom<&str> for ResetFormat {
+    type Error = ();
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.eq_ignore_ascii_case("time") {
+            Ok(Self::Time)
+        } else if value.eq_ignore_ascii_case("duration") {
+            Ok(Self::Duration)
+        } else {
+            Err(())
+        }
+    }
+}
 
 impl UsageSegment {
     pub fn new() -> Self {
@@ -73,7 +138,7 @@ impl UsageSegment {
                 let reset_utc = dt.with_timezone(&Utc);
                 let remaining = reset_utc.signed_duration_since(now);
 
-                if remaining.num_seconds() <= 0 {
+                if remaining.num_seconds() < 60 {
                     return "now".to_string();
                 }
 
@@ -110,7 +175,18 @@ impl UsageSegment {
         }
 
         let content = std::fs::read_to_string(&cache_path).ok()?;
-        serde_json::from_str(&content).ok()
+        let mut cache: ApiUsageCache = serde_json::from_str(&content).ok()?;
+
+        if let Some(legacy_resets_at) = cache.legacy_resets_at.clone() {
+            if cache.five_hour_resets_at.is_none() {
+                cache.five_hour_resets_at = Some(legacy_resets_at.clone());
+            }
+            if cache.seven_day_resets_at.is_none() {
+                cache.seven_day_resets_at = Some(legacy_resets_at);
+            }
+        }
+
+        Some(cache)
     }
 
     fn save_cache(&self, cache: &ApiUsageCache) {
@@ -238,72 +314,87 @@ impl Segment for UsageSegment {
             .map(|cache| self.is_cache_valid(cache, cache_duration))
             .unwrap_or(false);
 
-        let reset_period = segment_config
+        let reset_period_raw = segment_config
             .and_then(|sc| sc.options.get("reset_period"))
             .and_then(|v| v.as_str())
-            .unwrap_or("session")
-            .to_string();
+            .map(str::to_string);
 
-        let reset_format = segment_config
+        let reset_period = reset_period_raw
+            .as_deref()
+            .and_then(|value| ResetPeriod::try_from(value).ok())
+            .unwrap_or_default();
+
+        let reset_format_raw = segment_config
             .and_then(|sc| sc.options.get("reset_format"))
             .and_then(|v| v.as_str())
-            .unwrap_or("time")
-            .to_string();
+            .map(str::to_string);
 
-        let (five_hour_util, seven_day_util, five_hour_resets_at, seven_day_resets_at) = if use_cached {
-            let cache = cached_data.unwrap();
-            (
-                cache.five_hour_utilization,
-                cache.seven_day_utilization,
-                cache.five_hour_resets_at,
-                cache.seven_day_resets_at,
-            )
-        } else {
-            match self.fetch_api_usage(api_base_url, &token, timeout) {
-                Some(response) => {
-                    let cache = ApiUsageCache {
-                        five_hour_utilization: response.five_hour.utilization,
-                        seven_day_utilization: response.seven_day.utilization,
-                        five_hour_resets_at: response.five_hour.resets_at.clone(),
-                        seven_day_resets_at: response.seven_day.resets_at.clone(),
-                        cached_at: Utc::now().to_rfc3339(),
-                    };
-                    self.save_cache(&cache);
+        let reset_format = reset_format_raw
+            .as_deref()
+            .and_then(|value| ResetFormat::try_from(value).ok())
+            .unwrap_or_default();
+
+        let (five_hour_util, seven_day_util, five_hour_resets_at, seven_day_resets_at) =
+            if use_cached {
+                if let Some(cache) = cached_data.as_ref() {
                     (
-                        response.five_hour.utilization,
-                        response.seven_day.utilization,
-                        response.five_hour.resets_at,
-                        response.seven_day.resets_at,
+                        cache.five_hour_utilization,
+                        cache.seven_day_utilization,
+                        cache.five_hour_resets_at.clone(),
+                        cache.seven_day_resets_at.clone(),
                     )
+                } else {
+                    return None;
                 }
-                None => {
-                    if let Some(cache) = cached_data {
+            } else {
+                match self.fetch_api_usage(api_base_url, &token, timeout) {
+                    Some(response) => {
+                        let cache = ApiUsageCache {
+                            five_hour_utilization: response.five_hour.utilization,
+                            seven_day_utilization: response.seven_day.utilization,
+                            five_hour_resets_at: response.five_hour.resets_at.clone(),
+                            seven_day_resets_at: response.seven_day.resets_at.clone(),
+                            legacy_resets_at: None,
+                            cached_at: Utc::now().to_rfc3339(),
+                        };
+                        self.save_cache(&cache);
                         (
-                            cache.five_hour_utilization,
-                            cache.seven_day_utilization,
-                            cache.five_hour_resets_at,
-                            cache.seven_day_resets_at,
+                            response.five_hour.utilization,
+                            response.seven_day.utilization,
+                            response.five_hour.resets_at,
+                            response.seven_day.resets_at,
                         )
-                    } else {
-                        return None;
+                    }
+                    None => {
+                        if let Some(cache) = cached_data {
+                            (
+                                cache.five_hour_utilization,
+                                cache.seven_day_utilization,
+                                cache.five_hour_resets_at,
+                                cache.seven_day_resets_at,
+                            )
+                        } else {
+                            return None;
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        let resets_at = if reset_period == "weekly" {
-            seven_day_resets_at.as_deref()
-        } else {
-            five_hour_resets_at.as_deref()
+        let resets_at = match reset_period {
+            ResetPeriod::Session => five_hour_resets_at
+                .as_deref()
+                .or(seven_day_resets_at.as_deref()),
+            ResetPeriod::Weekly => seven_day_resets_at
+                .as_deref()
+                .or(five_hour_resets_at.as_deref()),
         };
 
         let dynamic_icon = Self::get_circle_icon(seven_day_util / 100.0);
         let five_hour_percent = five_hour_util.round() as u8;
         let primary = format!("{}%", five_hour_percent);
-        let reset_str = if reset_format == "duration" {
-            Self::format_reset_duration(resets_at)
-        } else {
-            Self::format_reset_time(resets_at)
+        let reset_str = match reset_format {
+            ResetFormat::Duration => Self::format_reset_duration(resets_at),
+            ResetFormat::Time => Self::format_reset_time(resets_at),
         };
         let secondary = format!("· {}", reset_str);
 
@@ -317,6 +408,32 @@ impl Segment for UsageSegment {
             "seven_day_utilization".to_string(),
             seven_day_util.to_string(),
         );
+        metadata.insert(
+            "reset_period".to_string(),
+            reset_period.as_str().to_string(),
+        );
+        metadata.insert(
+            "reset_format".to_string(),
+            reset_format.as_str().to_string(),
+        );
+        if let Some(invalid_reset_period) = reset_period_raw
+            .as_deref()
+            .filter(|value| ResetPeriod::try_from(*value).is_err())
+        {
+            metadata.insert(
+                "invalid_reset_period".to_string(),
+                invalid_reset_period.to_string(),
+            );
+        }
+        if let Some(invalid_reset_format) = reset_format_raw
+            .as_deref()
+            .filter(|value| ResetFormat::try_from(*value).is_err())
+        {
+            metadata.insert(
+                "invalid_reset_format".to_string(),
+                invalid_reset_format.to_string(),
+            );
+        }
 
         Some(SegmentData {
             primary,
@@ -327,5 +444,45 @@ impl Segment for UsageSegment {
 
     fn id(&self) -> SegmentId {
         SegmentId::Usage
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResetFormat, ResetPeriod, UsageSegment};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn reset_period_parses_expected_values() {
+        assert!(matches!(
+            ResetPeriod::try_from("session"),
+            Ok(ResetPeriod::Session)
+        ));
+        assert!(matches!(
+            ResetPeriod::try_from("WEEKLY"),
+            Ok(ResetPeriod::Weekly)
+        ));
+        assert!(ResetPeriod::try_from("invalid").is_err());
+    }
+
+    #[test]
+    fn reset_format_parses_expected_values() {
+        assert!(matches!(
+            ResetFormat::try_from("time"),
+            Ok(ResetFormat::Time)
+        ));
+        assert!(matches!(
+            ResetFormat::try_from("DURATION"),
+            Ok(ResetFormat::Duration)
+        ));
+        assert!(ResetFormat::try_from("invalid").is_err());
+    }
+
+    #[test]
+    fn duration_under_one_minute_is_now() {
+        let reset_at = (Utc::now() + Duration::seconds(30)).to_rfc3339();
+        let display = UsageSegment::format_reset_duration(Some(&reset_at));
+
+        assert_eq!(display, "now");
     }
 }
